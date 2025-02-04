@@ -1,46 +1,60 @@
 import ffmpeg
 import numpy as np
 import cv2
+import pickle
 import matplotlib.pyplot as plt
+import os
+from tqdm import tqdm
+from ultralytics import YOLO
+import torch
 
-
-def extract_frames_ffmpeg_numpy(video_path, fps=1):
+def extract_frames_ffmpeg(video_path, fps=1):
     """
-    Extract frames as numpy arrays using FFmpeg bindings.
+    Extract frames as numpy arrays using FFmpeg.
 
-    Args:
+    Arguments:
     - video_path (str): Path to the video file.
-    - fps (int): Frames per second to extract.
+    - fps (float): Frame extraction rate (frames per second).
 
     Returns:
-    - list: Extracted frames as numpy arrays.
+    - numpy.ndarray: Array of extracted frames with shape (num_frames, height, width, 3)
     """
-    # extract frames with FFmpeg and decode them directly into numpy arrays
-    process = (
-        ffmpeg
-        .input(video_path, r=fps)
-        .output("pipe:", format="rawvideo", pix_fmt="rgb24")
-        .run(capture_stdout=True, capture_stderr=True)
-    )
+    try:
+        # Get video information
+        probe = ffmpeg.probe(video_path)
+        video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+        width = int(video_info['width'])
+        height = int(video_info['height'])
 
-    # decode raw video stream into numpy
-    width, height = 720, 1280  # modify to target dimensions
-    video_frames = np.frombuffer(process[0], np.uint8).reshape([-1, height, width, 3])
+        # Extract frames using the 'fps' filter
+        process = (
+            ffmpeg
+            .input(video_path)
+            .filter('fps', fps=fps)  # Use filter to control frame rate
+            .output('pipe:', format='rawvideo', pix_fmt='rgb24')
+            .run(capture_stdout=True, capture_stderr=True, quiet=True)
+        )
 
-    return video_frames
+        frames = np.frombuffer(process[0], np.uint8).reshape(-1, height, width, 3)
+        return frames
+
+    except Exception as e:
+        print(f"FFmpeg error: {str(e)}")
+        raise
+
 
 
 def draw_bboxes(frame, model, results):
     """
     Draw bounding boxes and labels on the frame based on YOLO results.
 
-    Args:
-    - frame (numpy.ndarray): The image frame to draw on.
-    - model: The YOLO model used for predictions.
-    - results: YOLO results containing bounding box predictions.
+    Arguments:
+    - frame (numpy.ndarray): Image.
+    - model: YOLO model for predictions.
+    - results: YOLO results with predicted bounding boxes.
 
     Returns:
-    - numpy.ndarray: The frame with drawn bounding boxes and labels.
+    - numpy.ndarray: Image with drawn bounding boxes and labels.
     """
     for box in results.boxes:
         xyxy = box.xyxy.cpu().numpy()[0]
@@ -56,15 +70,15 @@ def draw_bboxes(frame, model, results):
 
 def extract_faces(frame, model, results):
     """
-    Extract faces from the frame using YOLO model.
+    Extract faces from the frame using YOLO.
 
-    Args:
-    - frame (numpy.ndarray): The image frame to process.
-    - model: The YOLO model for face detection.
-    - results: YOLO results containing bounding box predictions.
+    Arguments:
+    - frame (numpy.ndarray): Image.
+    - model: YOLO model for face detection.
+    - results: YOLO results with predicted bounding boxes.
 
     Returns:
-    - list: A list of face images as numpy arrays.
+    - list: List of face images as numpy arrays.
     """
     faces = []
 
@@ -79,10 +93,10 @@ def extract_faces(frame, model, results):
 
 def draw_faces(faces):
     """
-    Draw and display the list of face images.
+    Draw and display face images.
 
-    Args:
-    - faces (list): A list of face images as numpy arrays.
+    Arguments:
+    - faces (list): List of face images (numpy arrays).
     """
     plt.figure(figsize=(15, 10))
     for i, face in enumerate(faces):
@@ -91,3 +105,108 @@ def draw_faces(faces):
         plt.axis('off')
         plt.title(f'Face {i + 1}')
     plt.show()
+
+
+# async attempt
+def stream_frames(video_path, interval=1/5):
+    """
+    Stream frames through FFmpeg with an interval of `interval` seconds.
+
+    Arguments:
+    - video_path (str): Path to the video file.
+    - interval (int): Interval between extracted frames (in seconds).
+
+    Yields:
+    - numpy.ndarray: Frames as numpy arrays.
+    """
+    try:
+        # Get video information
+        probe = ffmpeg.probe(video_path)
+        video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+        width = int(video_info['width'])
+        height = int(video_info['height'])
+
+        # Use the 'select' filter to extract frames at the desired interval
+        process = (
+            ffmpeg
+            .input(video_path)
+            .filter('fps', interval)
+            .output('pipe:', format='rawvideo', pix_fmt='rgb24')
+            # .run(capture_stdout=True, capture_stderr=True, quiet=True)
+            .run_async(pipe_stdout=True, pipe_stderr=True)
+        )
+
+        try:
+            while True:
+                in_bytes = process.stdout.read(width * height * 3)
+                if not in_bytes:
+                    break
+                yield np.frombuffer(in_bytes, np.uint8).reshape(height, width, 3)
+        finally:
+            process.stdout.close()
+            process.wait()
+
+    except Exception as e:
+        print(f"FFmpeg error: {str(e)}")
+        raise
+
+
+def process_speaker(video_path, annotation_path, output_path, interval=5):
+    """
+    Process video with an interval of 'interval' seconds:
+    - Face detection using the YOLO model.
+    - Extracted faces are saved as matrices (numpy arrays) without compression.
+    - Results are saved in a pickle file.
+
+    Arguments:
+    - video_path (str): Path to the video file.
+    - annotation_path (str): Path to the annotation file.
+    - output_path (str): Path for saving the results (pickle).
+    - interval (int): Interval between extracted frames (in seconds).
+    """
+    # Determine the device (GPU if available)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = YOLO('video_faces_utils/yolov11n-face.pt').to(device)
+
+    # Load annotations
+    with open(annotation_path, 'r') as f:
+        headers = f.readline().strip().split(',')
+        annotations = [line.strip().split(',') for line in f]
+
+    # Prepare data for saving
+    data = {
+        'speaker_id': os.path.basename(video_path).split('_')[0].upper(),
+        'frames': [],
+        'annotations': annotations,
+        'headers': headers
+    }
+
+    # Stream process frames
+    frames = extract_frames_ffmpeg(video_path, fps=1 / interval)
+    for idx, frame in tqdm(enumerate(frames)):
+        # Face detection on the frame
+        with torch.no_grad():
+            results = model.predict(frame, imgsz=640, device=device, verbose=False)[0]
+
+        # Extract faces as matrices
+        faces = []
+        for box in results.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy.cpu().numpy()[0])
+            face = frame[y1:y2, x1:x2]
+            faces.append(face)
+
+        # Save data for the frame
+        data['frames'].append({
+            'second': (idx + 1) * interval,
+            'faces': faces,
+            'annotation': annotations[idx] if idx < len(annotations) else []
+        })
+
+        # Clear memory
+        del frame, results
+        if device == 'cuda':
+            torch.cuda.empty_cache()
+
+    # Save results to a pickle file
+    with open(output_path, 'wb') as f:
+        pickle.dump(data, f)
