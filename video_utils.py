@@ -7,6 +7,8 @@ import os
 from tqdm import tqdm
 from ultralytics import YOLO
 import torch
+import torchvision.models as models
+from torchvision import transforms
 
 def extract_frames_ffmpeg(video_path, fps=1):
     """
@@ -210,3 +212,87 @@ def process_speaker(video_path, annotation_path, output_path, interval=5):
     # Save results to a pickle file
     with open(output_path, 'wb') as f:
         pickle.dump(data, f)
+
+def get_face_feature_extractor(device='cpu'):
+    """
+    Load a pre-trained ResNet18 model with the final layer removed for feature extraction.
+
+    Args:
+    - device (str): 'cuda' or 'cpu'
+
+    Returns:
+    - torch.nn.Module: The feature extraction model.
+    """
+    model = models.resnet18(pretrained=True)
+    # Replace the last fully connected layer with an identity function to obtain features
+    model.fc = torch.nn.Identity()
+    model = model.to(device)
+    model.eval()
+    return model
+
+# Define the transformation pipeline for face images
+face_transform = transforms.Compose([
+    transforms.ToPILImage(),             # Convert the input image (numpy array) to a PIL Image.
+    transforms.Resize((224, 224)),         # Resize the image to 224x224 pixels.
+    transforms.ToTensor(),                 # Convert the image to a PyTorch tensor and scale pixel values to [0, 1].
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],  # Normalize using ImageNet mean.
+                         std=[0.229, 0.224, 0.225])   # Normalize using ImageNet standard deviation.
+])
+
+def extract_face_features_from_faces(faces, feature_extractor, device='cpu'):
+    """
+    Extract feature vectors for each face image.
+
+    Args:
+    - faces (list): List of face images (numpy arrays).
+    - feature_extractor (torch.nn.Module): Model used for feature extraction.
+    - device (str): 'cuda' or 'cpu'.
+
+    Returns:
+    - list: List of feature vectors (torch.Tensor) for each face.
+    """
+    features = []
+    for face in faces:
+        try:
+            input_tensor = face_transform(face)
+        except Exception as e:
+            print(f"Error transforming face: {e}")
+            continue
+        input_tensor = input_tensor.unsqueeze(0).to(device)  # Add batch dimension
+        with torch.no_grad():
+            feature = feature_extractor(input_tensor)
+        features.append(feature.cpu().squeeze(0))
+    return features
+
+def extract_face_features_from_video(video_path, yolo_model, feature_extractor, interval=1, device='cpu'):
+    """
+    Extract face feature vectors from faces detected in video frames.
+
+    Args:
+    - video_path (str): Path to the video file.
+    - yolo_model: YOLO model for face detection.
+    - feature_extractor (torch.nn.Module): Model for extracting face features.
+    - interval (int or float): Interval between frames in seconds.
+    - device (str): 'cuda' or 'cpu'.
+
+    Returns:
+    - dict: A dictionary where keys are frame times and values are lists of face feature vectors.
+    """
+    face_features_dict = {}
+    frames = extract_frames_ffmpeg(video_path, fps=1/interval)
+    for idx, frame in tqdm(enumerate(frames), desc="Processing frames"):
+        with torch.no_grad():
+            results = yolo_model.predict(frame, imgsz=640, device=device, verbose=False)[0]
+        # Extract faces from the frame
+        faces = extract_faces(frame, yolo_model, results)
+        # If faces are found, extract features for each face
+        if faces:
+            features = extract_face_features_from_faces(faces, feature_extractor, device=device)
+            face_features_dict[(idx+1)*interval] = features
+        else:
+            face_features_dict[(idx+1)*interval] = []
+        # Free memory
+        del frame, results
+        if device == 'cuda':
+            torch.cuda.empty_cache()
+    return face_features_dict
