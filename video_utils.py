@@ -9,6 +9,8 @@ from ultralytics import YOLO
 import torch
 import torchvision.models as models
 from torchvision import transforms
+import timm
+import math
 
 def extract_frames_ffmpeg(video_path, fps=1):
     """
@@ -44,8 +46,6 @@ def extract_frames_ffmpeg(video_path, fps=1):
         print(f"FFmpeg error: {str(e)}")
         raise
 
-
-
 def draw_bboxes(frame, model, results):
     """
     Draw bounding boxes and labels on the frame based on YOLO results.
@@ -69,7 +69,6 @@ def draw_bboxes(frame, model, results):
         cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
     return frame
 
-
 def extract_faces(frame, model, results):
     """
     Extract faces from the frame using YOLO.
@@ -83,15 +82,12 @@ def extract_faces(frame, model, results):
     - list: List of face images as numpy arrays.
     """
     faces = []
-
     for box in results.boxes:
         xyxy = box.xyxy.cpu().numpy()[0]
         x1, y1, x2, y2 = map(int, xyxy)
         face_image = frame[y1:y2, x1:x2]
         faces.append(face_image)
-
     return faces
-
 
 def draw_faces(faces):
     """
@@ -108,8 +104,6 @@ def draw_faces(faces):
         plt.title(f'Face {i + 1}')
     plt.show()
 
-
-# async attempt
 def stream_frames(video_path, interval=1/5):
     """
     Stream frames through FFmpeg with an interval of `interval` seconds.
@@ -122,22 +116,17 @@ def stream_frames(video_path, interval=1/5):
     - numpy.ndarray: Frames as numpy arrays.
     """
     try:
-        # Get video information
         probe = ffmpeg.probe(video_path)
         video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
         width = int(video_info['width'])
         height = int(video_info['height'])
-
-        # Use the 'select' filter to extract frames at the desired interval
         process = (
             ffmpeg
             .input(video_path)
             .filter('fps', interval)
             .output('pipe:', format='rawvideo', pix_fmt='rgb24')
-            # .run(capture_stdout=True, capture_stderr=True, quiet=True)
             .run_async(pipe_stdout=True, pipe_stderr=True)
         )
-
         try:
             while True:
                 in_bytes = process.stdout.read(width * height * 3)
@@ -147,75 +136,13 @@ def stream_frames(video_path, interval=1/5):
         finally:
             process.stdout.close()
             process.wait()
-
     except Exception as e:
         print(f"FFmpeg error: {str(e)}")
         raise
 
-
-def process_speaker(video_path, annotation_path, output_path, interval=5):
-    """
-    Process video with an interval of 'interval' seconds:
-    - Face detection using the YOLO model.
-    - Extracted faces are saved as matrices (numpy arrays) without compression.
-    - Results are saved in a pickle file.
-
-    Arguments:
-    - video_path (str): Path to the video file.
-    - annotation_path (str): Path to the annotation file.
-    - output_path (str): Path for saving the results (pickle).
-    - interval (int): Interval between extracted frames (in seconds).
-    """
-    # Determine the device (GPU if available)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = YOLO('video_faces_utils/yolov11n-face.pt').to(device)
-
-    # Load annotations
-    with open(annotation_path, 'r') as f:
-        headers = f.readline().strip().split(',')
-        annotations = [line.strip().split(',') for line in f]
-
-    # Prepare data for saving
-    data = {
-        'speaker_id': os.path.basename(video_path).split('_')[0].upper(),
-        'frames': [],
-        'annotations': annotations,
-        'headers': headers
-    }
-
-    # Stream process frames
-    frames = extract_frames_ffmpeg(video_path, fps=1 / interval)
-    for idx, frame in tqdm(enumerate(frames)):
-        # Face detection on the frame
-        with torch.no_grad():
-            results = model.predict(frame, imgsz=640, device=device, verbose=False)[0]
-
-        # Extract faces as matrices
-        faces = []
-        for box in results.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy.cpu().numpy()[0])
-            face = frame[y1:y2, x1:x2]
-            faces.append(face)
-
-        # Save data for the frame
-        data['frames'].append({
-            'second': (idx + 1) * interval,
-            'faces': faces,
-            'annotation': annotations[idx] if idx < len(annotations) else []
-        })
-
-        # Clear memory
-        del frame, results
-        if device == 'cuda':
-            torch.cuda.empty_cache()
-
-    # Save results to a pickle file
-    with open(output_path, 'wb') as f:
-        pickle.dump(data, f)
-
 def get_face_feature_extractor(device='cpu'):
     """
-    Load a pre-trained ResNet18 model with the final layer removed for feature extraction.
+    Load a pre-trained MViT V2 Small model with the classifier head removed for feature extraction.
 
     Args:
     - device (str): 'cuda' or 'cpu'
@@ -223,20 +150,18 @@ def get_face_feature_extractor(device='cpu'):
     Returns:
     - torch.nn.Module: The feature extraction model.
     """
-    model = models.resnet18(pretrained=True)
-    # Replace the last fully connected layer with an identity function to obtain features
-    model.fc = torch.nn.Identity()
+    model = timm.create_model('mvitv2_small', pretrained=True)
+    model.head = torch.nn.Identity()
     model = model.to(device)
     model.eval()
     return model
 
-# Define the transformation pipeline for face images
 face_transform = transforms.Compose([
-    transforms.ToPILImage(),             # Convert the input image (numpy array) to a PIL Image.
-    transforms.Resize((224, 224)),         # Resize the image to 224x224 pixels.
-    transforms.ToTensor(),                 # Convert the image to a PyTorch tensor and scale pixel values to [0, 1].
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],  # Normalize using ImageNet mean.
-                         std=[0.229, 0.224, 0.225])   # Normalize using ImageNet standard deviation.
+    transforms.ToPILImage(),
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
 ])
 
 def extract_face_features_from_faces(faces, feature_extractor, device='cpu'):
@@ -264,6 +189,28 @@ def extract_face_features_from_faces(faces, feature_extractor, device='cpu'):
         features.append(feature.cpu().squeeze(0))
     return features
 
+def extract_frame_feature(frame, feature_extractor, device='cpu'):
+    """
+    Extract feature vector for the entire frame.
+
+    Args:
+      frame (numpy.ndarray): Input frame.
+      feature_extractor (torch.nn.Module): Model used for feature extraction.
+      device (str): 'cuda' or 'cpu'.
+
+    Returns:
+      torch.Tensor: Feature vector for the frame.
+    """
+    try:
+        input_tensor = face_transform(frame)
+    except Exception as e:
+        print(f"Error transforming frame: {e}")
+        return None
+    input_tensor = input_tensor.unsqueeze(0).to(device)
+    with torch.no_grad():
+        feature = feature_extractor(input_tensor)
+    return feature.cpu().squeeze(0)
+
 def extract_face_features_from_video(video_path, yolo_model, feature_extractor, interval=1, device='cpu'):
     """
     Extract face feature vectors from faces detected in video frames.
@@ -283,16 +230,143 @@ def extract_face_features_from_video(video_path, yolo_model, feature_extractor, 
     for idx, frame in tqdm(enumerate(frames), desc="Processing frames"):
         with torch.no_grad():
             results = yolo_model.predict(frame, imgsz=640, device=device, verbose=False)[0]
-        # Extract faces from the frame
         faces = extract_faces(frame, yolo_model, results)
-        # If faces are found, extract features for each face
         if faces:
             features = extract_face_features_from_faces(faces, feature_extractor, device=device)
             face_features_dict[(idx+1)*interval] = features
         else:
             face_features_dict[(idx+1)*interval] = []
-        # Free memory
         del frame, results
         if device == 'cuda':
             torch.cuda.empty_cache()
     return face_features_dict
+
+def process_video(video_path, annotation_path, output_path, interval=5, extraction_fps=1):
+    """
+    Processes a video with a given interval (in seconds):
+    - Extracts all frames using the specified extraction FPS.
+    - Groups the frames into intervals of 'interval' seconds.
+    - For each interval:
+         * Performs face detection and feature extraction for each frame.
+         * Collects frame features and face features (lists, without averaging).
+         * Aggregates all detected face images.
+    - From the annotations (CSV), extracts the VAD label for each interval:
+         'arousal' and 'valence' are taken from the annotations, with 'dominance' fixed to 0.
+    - The 'categorical_label' is determined by selecting from the key emotions:
+         'cheerful', 'happy', 'angry', 'nervous', and 'sad'.
+         * If all values are 1, the label is set to "neutral".
+         * Otherwise, the emotion with the highest value is chosen.
+         * In case of a tie, a fixed priority is applied: angry > nervous > sad > happy > cheerful.
+    - A dictionary is created for each interval containing all the information.
+    - The result is saved to a pickle file, allowing access to each interval by index.
+    """
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Load the YOLO model for face detection
+    model = YOLO('video_faces_utils/yolov11n-face.pt').to(device)
+    # Load the feature extractor model
+    face_feature_extractor = get_face_feature_extractor(device=device)
+
+    # Load annotations from CSV
+    with open(annotation_path, 'r') as f:
+        headers = f.readline().strip().split(',')
+        annotations = [line.strip().split(',') for line in f]
+
+    data = {
+        'speaker_id': os.path.basename(video_path).split('_')[0].upper(),
+        'frames': []
+    }
+
+    # Extract all frames using the given extraction FPS
+    all_frames = extract_frames_ffmpeg(video_path, fps=extraction_fps)
+    total_frames = all_frames.shape[0]
+    frames_per_interval = int(extraction_fps * interval)
+    num_intervals = math.ceil(total_frames / frames_per_interval)
+
+    for interval_idx in tqdm(range(num_intervals), desc="Processing intervals"):
+        # Determine the range of frames for the current interval
+        start_idx = interval_idx * frames_per_interval
+        end_idx = min(start_idx + frames_per_interval, total_frames)
+        interval_frames = all_frames[start_idx:end_idx]
+
+        # Lists to accumulate features over the interval
+        interval_frame_features = []
+        interval_face_features = []
+        interval_faces = []
+
+        # Process each frame in the interval
+        for frame in interval_frames:
+            # Face detection for the frame
+            with torch.no_grad():
+                results = model.predict(frame, imgsz=640, device=device, verbose=False)[0]
+
+            # Extract faces from the frame
+            faces = []
+            for box in results.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy.cpu().numpy()[0])
+                face_img = frame[y1:y2, x1:x2]
+                faces.append(face_img)
+            # Add all detected faces
+            interval_faces.extend(faces)
+
+            # Extract features for the frame and its faces
+            frame_feat = extract_frame_feature(frame, face_feature_extractor, device=device)
+            if frame_feat is not None:
+                interval_frame_features.append(frame_feat)
+            if faces:
+                face_feats = extract_face_features_from_faces(faces, face_feature_extractor, device=device)
+                interval_face_features.extend(face_feats)
+
+            del results
+            if device == 'cuda':
+                torch.cuda.empty_cache()
+
+        # Get VAD label from annotations for the interval (assuming one annotation per interval)
+        if interval_idx < len(annotations):
+            ann = annotations[interval_idx]
+            try:
+                arousal = float(ann[1])
+                valence = float(ann[2])
+            except Exception:
+                arousal, valence = 0.0, 0.0
+        else:
+            arousal, valence = 0.0, 0.0
+        dominance = 0.0
+        VAD = (arousal, valence, dominance)
+
+        # Determine the categorical_label using key emotions:
+        # We consider only: 'cheerful', 'happy', 'angry', 'nervous', 'sad'
+        key_emotions = ['cheerful', 'happy', 'angry', 'nervous', 'sad']
+        emotion_values = []
+        for key in key_emotions:
+            try:
+                idx_key = headers.index(key)
+                val = float(annotations[interval_idx][idx_key])
+            except Exception:
+                val = 1.0
+            emotion_values.append(val)
+        if all(v == 1.0 for v in emotion_values):
+            categorical_label = "neutral"
+        else:
+            # In case of a tie, use fixed priority: angry > nervous > sad > happy > cheerful
+            priority = {'angry': 5, 'nervous': 4, 'sad': 3, 'happy': 2, 'cheerful': 1}
+            max_val = max(emotion_values)
+            candidates = [key for key, v in zip(key_emotions, emotion_values) if v == max_val]
+            candidates.sort(key=lambda x: priority[x], reverse=True)
+            categorical_label = candidates[0]
+
+        # Use the end time of the interval as representative time
+        interval_time = (interval_idx + 1) * interval
+        frame_dict = {
+            "second": interval_time,
+            "faces": interval_faces,                   # List of face images over the interval
+            "face_features": interval_face_features,   # List of face feature vectors
+            "frame_features": interval_frame_features, # List of frame feature vectors
+            "VAD": VAD,
+            "categorical_label": categorical_label,
+            "audio": 0,   # Placeholder for audio
+            "text": 0     # Placeholder for text
+        }
+        data['frames'].append(frame_dict)
+
+    with open(output_path, 'wb') as f:
+        pickle.dump(data, f)
